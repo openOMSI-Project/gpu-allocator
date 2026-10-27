@@ -695,6 +695,25 @@ pub struct Allocator {
     allocation_sizes: AllocationSizes,
 }
 
+#[cfg(test)]
+mod memory_type_tests;
+
+fn find_compatible_memory_type(
+    memory_types: &[MemoryType],
+    memory_req: &vk::MemoryRequirements,
+    flags: vk::MemoryPropertyFlags,
+    allowed: impl Fn(&MemoryType) -> bool,
+) -> Option<u32> {
+    memory_types
+        .iter()
+        .find(|memory_type| {
+            (1 << memory_type.memory_type_index) & memory_req.memory_type_bits != 0
+                && memory_type.memory_properties.contains(flags)
+                && allowed(memory_type)
+        })
+        .map(|memory_type| memory_type.memory_type_index as _)
+}
+
 impl fmt::Debug for Allocator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.generate_report().fmt(f)
@@ -814,23 +833,22 @@ impl Allocator {
             }
             MemoryLocation::Unknown => vk::MemoryPropertyFlags::empty(),
         };
-        let mut memory_type_index_opt =
-            self.find_memorytype_index(&desc.requirements, mem_loc_preferred_bits)
-                .filter(|&i| !(desc.location == MemoryLocation::CpuToGpu && self.is_small_bar(i as usize)));
+        let mut memory_type_index_opt = find_compatible_memory_type(
+            &self.memory_types,
+            &desc.requirements,
+            mem_loc_preferred_bits,
+            |t| {
+                desc.location != MemoryLocation::CpuToGpu || !self.is_small_bar(t.memory_type_index)
+            },
+        );
 
         if memory_type_index_opt.is_none() && desc.location == MemoryLocation::CpuToGpu {
-            memory_type_index_opt = self
-                .memory_types
-                .iter()
-                .find(|t| {
-                    (1 << t.memory_type_index) & desc.requirements.memory_type_bits != 0
-                        && t.memory_properties.contains(
-                            vk::MemoryPropertyFlags::HOST_VISIBLE
-                                | vk::MemoryPropertyFlags::HOST_COHERENT,
-                        )
-                        && !self.is_small_bar(t.memory_type_index)
-                })
-                .map(|t| t.memory_type_index as _);
+            memory_type_index_opt = find_compatible_memory_type(
+                &self.memory_types,
+                &desc.requirements,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                |t| !self.is_small_bar(t.memory_type_index),
+            );
         }
 
         if memory_type_index_opt.is_none() {
@@ -871,12 +889,27 @@ impl Allocator {
                 let mem_loc_preferred_bits =
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
-                let memory_type_index_opt =
-                    self.find_memorytype_index(&desc.requirements, mem_loc_preferred_bits);
+                let memory_type_index_opt = find_compatible_memory_type(
+                    &self.memory_types,
+                    &desc.requirements,
+                    mem_loc_preferred_bits,
+                    |t| {
+                        t.memory_type_index != memory_type_index
+                            && !self.is_small_bar(t.memory_type_index)
+                    },
+                )
+                .or_else(|| {
+                    find_compatible_memory_type(
+                        &self.memory_types,
+                        &desc.requirements,
+                        mem_loc_preferred_bits,
+                        |t| t.memory_type_index != memory_type_index,
+                    )
+                });
 
                 let memory_type_index = match memory_type_index_opt {
                     Some(x) => x as usize,
-                    None => return Err(AllocationError::NoCompatibleMemoryTypeFound),
+                    None => return allocation,
                 };
 
                 self.memory_types[memory_type_index].allocate(
@@ -949,9 +982,9 @@ impl Allocator {
     /// A host-visible VRAM type on a BAR heap without Resizable BAR (256 MiB, shared by all apps).
     fn is_small_bar(&self, index: usize) -> bool {
         let t = &self.memory_types[index];
-        t.memory_properties.contains(
-            vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE,
-        ) && self.memory_heaps[t.heap_index].size <= 512 * 1024 * 1024
+        t.memory_properties
+            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE)
+            && self.memory_heaps[t.heap_index].size <= 512 * 1024 * 1024
     }
 
     fn find_memorytype_index(
@@ -959,13 +992,7 @@ impl Allocator {
         memory_req: &vk::MemoryRequirements,
         flags: vk::MemoryPropertyFlags,
     ) -> Option<u32> {
-        self.memory_types
-            .iter()
-            .find(|memory_type| {
-                (1 << memory_type.memory_type_index) & memory_req.memory_type_bits != 0
-                    && memory_type.memory_properties.contains(flags)
-            })
-            .map(|memory_type| memory_type.memory_type_index as _)
+        find_compatible_memory_type(&self.memory_types, memory_req, flags, |_| true)
     }
 
     pub fn generate_report(&self) -> AllocatorReport {
