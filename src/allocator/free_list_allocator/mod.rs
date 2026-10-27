@@ -21,6 +21,9 @@ pub(crate) mod visualizer;
 use super::{AllocationReport, AllocationType, SubAllocator, SubAllocatorBase};
 use crate::{AllocationError, Result};
 
+#[cfg(test)]
+mod tests;
+
 const USE_BEST_FIT: bool = true;
 
 fn align_down(val: u64, alignment: u64) -> u64 {
